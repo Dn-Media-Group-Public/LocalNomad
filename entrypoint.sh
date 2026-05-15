@@ -75,6 +75,9 @@ cfg.provider.ollama = {
   models,
 };
 
+// Only allow the local ollama provider — suppress all cloud providers.
+cfg.enabled_providers = ['ollama'];
+
 fs.writeFileSync(CFG, JSON.stringify(cfg, null, 2));
 console.log(`[locallm] opencode.json updated — ${fitting.length} models listed (RAM threshold: ${(totalGB * 0.85).toFixed(1)} GB)`);
 JSEOF
