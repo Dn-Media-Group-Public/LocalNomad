@@ -6,10 +6,12 @@ const { execSync, exec, spawn } = require('child_process');
 const os    = require('os');
 
 const OPENCODE_CONFIG = path.join(os.homedir(), '.config', 'opencode', 'opencode.json');
-const PROXY_PORT  = 11435;   // OpenCode talks here
-const UI_PORT     = 4000;    // CodeNomad SideCar status page
-const OLLAMA_HOST = '127.0.0.1';
-const OLLAMA_PORT = 11434;
+const PROXY_PORT      = 11435;   // OpenCode talks here
+const UI_PORT         = 4000;    // CodeNomad SideCar status page
+const OLLAMA_HOST     = '127.0.0.1';
+const OLLAMA_PORT     = 11434;   // Ollama — used for pull/list only
+const LLAMA_HOST      = '127.0.0.1';
+const LLAMA_PORT      = 11436;   // llama-server — used for inference
 
 // ── Model catalogue ───────────────────────────────────────────────────────────
 const MODELS = [
@@ -29,12 +31,17 @@ const MODELS = [
 ];
 
 // ── Server-side state ─────────────────────────────────────────────────────────
-// downloads: modelId → { status: 'downloading'|'done'|'error', pct, line, error }
 const downloads = new Map();
 const sseClients = new Set();
-let activeModel  = null;   // last model sent to ollama for inference
-const loadingModels = new Set(); // models currently being loaded into RAM by ollama
-let activeOllamaReq = null;  // the in-flight ollama inference request (if any)
+const loadingModels = new Set();
+
+// llama-server process management
+let llamaProc         = null;  // child_process handle
+let llamaModel        = null;  // modelId currently loaded
+let llamaReady        = false; // server passed health check
+let llamaStartPromise = null;  // dedup: reuse in-flight start for same model
+
+let activeInferenceReq = null; // in-flight http.ClientRequest to llama-server
 
 const INFERENCE_TIMEOUT_MS = 5 * 60 * 1000;  // 5 min hard cap per request
 
@@ -45,20 +52,122 @@ function broadcast(obj) {
   }
 }
 
-// Ask ollama to immediately unload a model from RAM.
-function unloadModel(modelId) {
-  return new Promise(resolve => {
-    const body = Buffer.from(JSON.stringify({ model: modelId, keep_alive: 0 }));
-    const req = http.request(
-      { hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: '/api/generate',
-        method: 'POST', headers: { 'content-type': 'application/json',
-                                   'content-length': body.length } },
-      res => { res.resume(); res.on('end', resolve); }
+// ── llama-server management ───────────────────────────────────────────────────
+
+// Resolve Ollama model ID → GGUF blob path on disk.
+// Ollama stores models as sha256-named blobs; the manifest records which one.
+function getModelGGUFPath(modelId) {
+  const [name, tag] = modelId.includes(':') ? modelId.split(':') : [modelId, 'latest'];
+  const modelsDir   = process.env.OLLAMA_MODELS || '/workspace/.ollama/models';
+  const manifestPath = path.join(
+    modelsDir, 'manifests', 'registry.ollama.ai', 'library', name, tag
+  );
+  const manifest  = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const layer     = manifest.layers.find(
+    l => l.mediaType === 'application/vnd.ollama.image.model'
+  );
+  if (!layer) throw new Error(`No model layer in manifest for ${modelId}`);
+  const digest = layer.digest.replace(':', '-'); // "sha256:abc…" → "sha256-abc…"
+  return path.join(modelsDir, 'blobs', digest);
+}
+
+function stopLlamaServer() {
+  if (llamaProc) {
+    try { llamaProc.kill('SIGTERM'); } catch (_) {}
+    llamaProc = null;
+  }
+  llamaModel        = null;
+  llamaReady        = false;
+  llamaStartPromise = null;
+}
+
+function checkLlamaHealth() {
+  return new Promise((resolve) => {
+    const req = http.get(
+      { hostname: LLAMA_HOST, port: LLAMA_PORT, path: '/health', timeout: 2000 },
+      res => {
+        let data = '';
+        res.on('data', d => data += d);
+        res.on('end', () => {
+          try { resolve(JSON.parse(data).status === 'ok'); }
+          catch (_) { resolve(false); }
+        });
+      }
     );
-    req.on('error', resolve);   // ignore errors — best-effort
-    req.write(body);
-    req.end();
+    req.on('error', () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
   });
+}
+
+// Start llama-server for modelId. Returns a Promise that resolves when ready.
+// Concurrent calls for the same model share one Promise (no double-start).
+// A call for a different model kills the current server first.
+function startLlamaServer(modelId) {
+  // Already up with the right model
+  if (llamaModel === modelId && llamaReady) return Promise.resolve();
+
+  // Already starting the same model — piggyback on the existing promise
+  if (llamaStartPromise && llamaModel === modelId) return llamaStartPromise;
+
+  // Different model (or no model) — kill whatever is running/starting
+  stopLlamaServer();
+
+  let modelPath;
+  try {
+    modelPath = getModelGGUFPath(modelId);
+  } catch (e) {
+    return Promise.reject(new Error(`Cannot find GGUF for ${modelId}: ${e.message}`));
+  }
+
+  const threads = os.cpus().length;
+  llamaProc = spawn('llama-server', [
+    '--model',       modelPath,
+    '--port',        String(LLAMA_PORT),
+    '--host',        LLAMA_HOST,
+    '--threads',     String(threads),
+    '--ctx-size',    '4096',
+    '--flash-attn',  'on',
+    '--cache-type-k', 'q8_0',
+    '--cache-type-v', 'q8_0',
+  ], { stdio: 'inherit' });
+
+  llamaModel = modelId;
+
+  llamaProc.on('exit', () => {
+    if (llamaModel === modelId) {
+      llamaProc         = null;
+      llamaModel        = null;
+      llamaReady        = false;
+      llamaStartPromise = null;
+    }
+  });
+
+  // Poll /health until ready (up to 120 s); share this promise with concurrent callers
+  llamaStartPromise = new Promise((resolve, reject) => {
+    let attempts = 0;
+    const MAX    = 120;
+    function poll() {
+      if (llamaModel !== modelId) {
+        // Server was replaced by a different model request — this start is moot
+        return reject(new Error(`Model switch cancelled start of ${modelId}`));
+      }
+      checkLlamaHealth().then(ok => {
+        if (ok) {
+          llamaReady        = true;
+          llamaStartPromise = null;
+          resolve();
+        } else if (++attempts >= MAX) {
+          llamaStartPromise = null;
+          reject(new Error(`llama-server did not become healthy within ${MAX}s`));
+        } else {
+          setTimeout(poll, 1000);
+        }
+      });
+    }
+    setTimeout(poll, 1000);
+  });
+
+  return llamaStartPromise;
 }
 
 // ── System helpers ────────────────────────────────────────────────────────────
@@ -71,7 +180,7 @@ function memGB(field) {
   return 8;
 }
 
-// Models on disk (async — avoids blocking the event loop)
+// Models on disk — still uses ollama list (Ollama manages downloads)
 function downloadedModels() {
   return new Promise(resolve => {
     exec('ollama list 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
@@ -81,14 +190,9 @@ function downloadedModels() {
   });
 }
 
-// Models currently loaded in RAM (async)
+// Running model — tracked locally now (llama-server, not ollama ps)
 function runningModels() {
-  return new Promise(resolve => {
-    exec('ollama ps 2>/dev/null', { timeout: 5000 }, (err, stdout) => {
-      if (err) return resolve([]);
-      resolve(stdout.split('\n').slice(1).map(l => l.split(/\s+/)[0]).filter(Boolean));
-    });
-  });
+  return Promise.resolve(llamaModel && llamaReady ? [llamaModel] : []);
 }
 
 function readBody(req) {
@@ -100,10 +204,7 @@ function readBody(req) {
   });
 }
 
-// ── Pull manager ──────────────────────────────────────────────────────────────
-// Returns a Promise that resolves when the model is on disk.
-// If a pull is already in progress for that model, waits for it rather than
-// spawning a second process.
+// ── Pull manager (unchanged — still uses ollama pull) ─────────────────────────
 function ensureDownloaded(modelId) {
   const existing = downloads.get(modelId);
   if (existing) {
@@ -123,10 +224,7 @@ function ensureDownloaded(modelId) {
   function handleChunk(data) {
     const text = data.toString();
     const pctMatch = text.match(/(\d+)%/);
-    if (pctMatch) {
-      const newPct = parseInt(pctMatch[1]);
-      dl.pct = newPct;
-    }
+    if (pctMatch) dl.pct = parseInt(pctMatch[1]);
     const cleaned = text.replace(/\r/g, '').split('\n').filter(s => s.trim()).pop() || '';
     if (cleaned) dl.line = cleaned;
     broadcast({ type: 'progress', model: modelId, pct: dl.pct, line: dl.line });
@@ -141,7 +239,7 @@ function ensureDownloaded(modelId) {
       resolve();
     } else {
       dl.status = 'error';
-      dl.error = `ollama pull exited with code ${code}`;
+      dl.error  = `ollama pull exited with code ${code}`;
       broadcast({ type: 'error', model: modelId, error: dl.error });
       reject(new Error(dl.error));
     }
@@ -150,54 +248,56 @@ function ensureDownloaded(modelId) {
   return promise;
 }
 
-// ── Proxy helpers ─────────────────────────────────────────────────────────────
-function makeOllamaOptions(req, bodyLen) {
+// ── Proxy helpers — forward to llama-server ───────────────────────────────────
+function makeLlamaOptions(req, bodyLen) {
   const headers = Object.assign({}, req.headers, {
-    host: `${OLLAMA_HOST}:${OLLAMA_PORT}`,
+    host: `${LLAMA_HOST}:${LLAMA_PORT}`,
   });
   if (bodyLen !== undefined) headers['content-length'] = bodyLen;
   delete headers['transfer-encoding'];
-  return { hostname: OLLAMA_HOST, port: OLLAMA_PORT,
+  return { hostname: LLAMA_HOST, port: LLAMA_PORT,
            path: req.url, method: req.method, headers };
 }
 
-// Forward a request to ollama, piping the response back.
-// bodyBuffer must be a Buffer (pass empty Buffer for requests with no body).
-// onFirstChunk (optional) fires once when the first response byte arrives.
-function forwardToOllama(req, res, bodyBuffer, onFirstChunk) {
-  if (activeOllamaReq) {
-    try { activeOllamaReq.destroy(); } catch (_) {}
-    activeOllamaReq = null;
+function forwardToLlama(req, res, bodyBuffer, onFirstChunk) {
+  if (activeInferenceReq) {
+    try { activeInferenceReq.destroy(); } catch (_) {}
+    activeInferenceReq = null;
   }
-  const opts = makeOllamaOptions(req, bodyBuffer.length);
+  const opts  = makeLlamaOptions(req, bodyBuffer.length);
   const proxy = http.request(opts, proxyRes => {
-    activeOllamaReq = null;
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
     const headers = Object.assign({}, proxyRes.headers, { 'x-accel-buffering': 'no' });
     res.writeHead(proxyRes.statusCode, headers);
-    if (onFirstChunk) {
-      proxyRes.once('data', () => { onFirstChunk(); });
-    }
+    if (onFirstChunk) proxyRes.once('data', () => onFirstChunk());
     proxyRes.pipe(res);
   });
-  activeOllamaReq = proxy;
+  activeInferenceReq = proxy;
   const timeoutHandle = setTimeout(() => {
     try { proxy.destroy(); } catch (_) {}
-    activeOllamaReq = null;
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
     if (!res.headersSent) res.writeHead(504);
     res.end(JSON.stringify({ error: { message: 'Inference timed out' } }));
   }, INFERENCE_TIMEOUT_MS);
   proxy.on('error', e => {
     clearTimeout(timeoutHandle);
-    activeOllamaReq = null;
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
     if (!res.headersSent) res.writeHead(502);
-    res.end(`Ollama proxy error: ${e.message}`);
+    res.end(`llama-server proxy error: ${e.message}`);
   });
   proxy.on('response', () => clearTimeout(timeoutHandle));
+  // Abort llama-server request immediately when client disconnects
+  res.on('close', () => {
+    clearTimeout(timeoutHandle);
+    if (activeInferenceReq === proxy) {
+      try { proxy.destroy(); } catch (_) {}
+      activeInferenceReq = null;
+    }
+  });
   proxy.write(bodyBuffer);
   proxy.end();
 }
 
-// Send one OpenAI-format SSE content chunk (headers must already be sent).
 function sendSSEChunk(res, content) {
   const payload = JSON.stringify({
     id: 'chatcmpl-locallm',
@@ -207,42 +307,32 @@ function sendSSEChunk(res, content) {
   res.write(`data: ${payload}\n\n`);
 }
 
-// Forward an already-started streaming response to ollama (headers already sent).
-// Sends SSE heartbeats until first byte arrives so clients don't show "queued".
-// Enforces INFERENCE_TIMEOUT_MS and aborts any previous in-flight request.
-// onFirstChunk (optional) fires once when the first response byte arrives.
-function pipeOllamaStream(req, res, bodyBuffer, onFirstChunk) {
-  // Abort any previous in-flight inference so ollama isn't blocked.
-  if (activeOllamaReq) {
-    try { activeOllamaReq.destroy(); } catch (_) {}
-    activeOllamaReq = null;
+function pipeToLlamaStream(req, res, bodyBuffer, onFirstChunk) {
+  if (activeInferenceReq) {
+    try { activeInferenceReq.destroy(); } catch (_) {}
+    activeInferenceReq = null;
   }
 
-  const opts = makeOllamaOptions(req, bodyBuffer.length);
+  const opts  = makeLlamaOptions(req, bodyBuffer.length);
   const proxy = http.request(opts, proxyRes => {
     clearInterval(heartbeat);
     clearTimeout(timeoutHandle);
-    activeOllamaReq = null;
-    if (onFirstChunk) {
-      proxyRes.once('data', () => { onFirstChunk(); });
-    }
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
+    if (onFirstChunk) proxyRes.once('data', () => onFirstChunk());
     proxyRes.pipe(res);
   });
 
-  activeOllamaReq = proxy;
+  activeInferenceReq = proxy;
 
-  // Heartbeat: send SSE comments every 5 s while waiting for first byte.
-  // This keeps the connection alive and prevents "queued" / stale detection.
   const heartbeat = setInterval(() => {
     try { res.write(': processing\n\n'); } catch (_) { clearInterval(heartbeat); }
   }, 5000);
 
-  // Hard timeout: if ollama takes too long, abort and tell the client.
   const timeoutHandle = setTimeout(() => {
     clearInterval(heartbeat);
     try { proxy.destroy(); } catch (_) {}
-    activeOllamaReq = null;
-    sendSSEChunk(res, `\n⏱ Inference timed out after ${INFERENCE_TIMEOUT_MS / 60000} min. Try a shorter prompt or smaller model.\n`);
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
+    sendSSEChunk(res, `\n⏱ Inference timed out after ${INFERENCE_TIMEOUT_MS / 60000} min.\n`);
     res.write('data: [DONE]\n\n');
     res.end();
   }, INFERENCE_TIMEOUT_MS);
@@ -250,10 +340,19 @@ function pipeOllamaStream(req, res, bodyBuffer, onFirstChunk) {
   proxy.on('error', e => {
     clearInterval(heartbeat);
     clearTimeout(timeoutHandle);
-    activeOllamaReq = null;
-    sendSSEChunk(res, `\n❌ Ollama error: ${e.message}`);
+    if (activeInferenceReq === proxy) activeInferenceReq = null;
+    sendSSEChunk(res, `\n❌ llama-server error: ${e.message}`);
     res.write('data: [DONE]\n\n');
     res.end();
+  });
+  // Abort llama-server request immediately when client disconnects
+  res.on('close', () => {
+    clearInterval(heartbeat);
+    clearTimeout(timeoutHandle);
+    if (activeInferenceReq === proxy) {
+      try { proxy.destroy(); } catch (_) {}
+      activeInferenceReq = null;
+    }
   });
   proxy.write(bodyBuffer);
   proxy.end();
@@ -263,20 +362,19 @@ function pipeOllamaStream(req, res, bodyBuffer, onFirstChunk) {
 const proxyServer = http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
 
-  // /v1/models — return all RAM-fitting models so OpenCode's /models shows them all,
-  // not just the subset ollama currently has on disk.
+  // /v1/models — return all RAM-fitting models
   if (req.method === 'GET' && url === '/v1/models') {
     const total   = memGB('MemTotal');
     const fitting = MODELS.filter(m => m.ramGB <= total * 0.85);
-    const data = fitting.map(m => ({
-      id: m.id, object: 'model', created: 0, owned_by: 'ollama',
+    const data    = fitting.map(m => ({
+      id: m.id, object: 'model', created: 0, owned_by: 'local',
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ object: 'list', data }));
     return;
   }
 
-  // /v1/chat/completions — auto-download if needed, then forward
+  // /v1/chat/completions — ensure llama-server is running with the right model, then forward
   if (req.method === 'POST' && url === '/v1/chat/completions') {
     const body = await readBody(req);
     let parsed;
@@ -285,17 +383,9 @@ const proxyServer = http.createServer(async (req, res) => {
 
     const modelId  = parsed.model || '';
     const isStream = parsed.stream !== false;
-    const [onDiskList, runningList] = await Promise.all([downloadedModels(), runningModels()]);
-    const onDisk   = onDiskList.includes(modelId);
+    const onDiskList = await downloadedModels();
+    const onDisk     = onDiskList.includes(modelId);
 
-    // Evict the previous model from RAM before loading a new one
-    if (activeModel && activeModel !== modelId) {
-      await unloadModel(activeModel);
-      broadcast({ type: 'unloaded', model: activeModel });
-    }
-    activeModel = modelId;
-
-    // Helper: signal loading→running transitions to the sidecar
     function signalLoading() {
       loadingModels.add(modelId);
       broadcast({ type: 'loading', model: modelId });
@@ -310,82 +400,107 @@ const proxyServer = http.createServer(async (req, res) => {
         `style="display:block;max-width:420px;border-radius:8px" alt="Model Status"/>`;
     }
 
-    if (onDisk) {
-      const alreadyRunning = runningList.includes(modelId);
-      if (!alreadyRunning && isStream) {
-        // Model on disk but not in RAM — show loading image then pipe inference
+    // Ensure model is downloaded first
+    if (!onDisk) {
+      if (isStream) {
         res.writeHead(200, {
-          'Content-Type':  'text/event-stream',
-          'Cache-Control': 'no-cache',
+          'Content-Type':      'text/event-stream',
+          'Cache-Control':     'no-cache',
           'X-Accel-Buffering': 'no',
         });
-        sendSSEChunk(res, `⏳ Loading **${modelId}** into RAM…\n\n${statusImgTag()}\n`);
-        signalLoading();
-        pipeOllamaStream(req, res, body, signalRunning);
-      } else if (alreadyRunning && isStream) {
-        // Model already in RAM, streaming — set SSE headers explicitly so the
-        // AI SDK sees text/event-stream before Ollama's first byte arrives.
-        res.writeHead(200, {
-          'Content-Type':  'text/event-stream',
-          'Cache-Control': 'no-cache',
-          'X-Accel-Buffering': 'no',
-        });
-        signalLoading();
-        pipeOllamaStream(req, res, body, signalRunning);
+        sendSSEChunk(res, `⬇ Model **${modelId}** not downloaded. Pulling now…\n\n${statusImgTag()}\n`);
+        try {
+          await ensureDownloaded(modelId);
+          sendSSEChunk(res, `✓ Download complete. Loading model…\n\n`);
+        } catch (e) {
+          sendSSEChunk(res, `❌ Download failed: ${e.message}\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
       } else {
-        // Non-streaming request
-        signalLoading();
-        forwardToOllama(req, res, body, signalRunning);
+        try { await ensureDownloaded(modelId); }
+        catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: `Download failed: ${e.message}` } }));
+          return;
+        }
       }
-      return;
     }
 
-    // Not on disk — need to pull first
-    if (isStream) {
-      // Start streaming response immediately so OpenCode shows activity
-      res.writeHead(200, {
-        'Content-Type':  'text/event-stream',
-        'Cache-Control': 'no-cache',
-        'X-Accel-Buffering': 'no',
-      });
-      sendSSEChunk(res, `⬇ Model **${modelId}** not downloaded. Pulling now…\n\n` +
-        `${statusImgTag()}\n`);
+    // Evict old model if switching (notify UI)
+    if (llamaModel && llamaModel !== modelId) {
+      broadcast({ type: 'unloaded', model: llamaModel });
+    }
 
-      try {
-        await ensureDownloaded(modelId);
-        sendSSEChunk(res, `✓ Download complete. Running inference…\n\n`);
+    // Start llama-server with the requested model (no-op if already running)
+    const alreadyRunning = (llamaModel === modelId && llamaReady);
+    if (!alreadyRunning) {
+      if (isStream) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type':      'text/event-stream',
+            'Cache-Control':     'no-cache',
+            'X-Accel-Buffering': 'no',
+          });
+        }
+        sendSSEChunk(res, `⏳ Loading **${modelId}** into RAM…\n\n${statusImgTag()}\n`);
         signalLoading();
-        pipeOllamaStream(req, res, body, signalRunning);
-      } catch (e) {
-        sendSSEChunk(res, `❌ Download failed: ${e.message}\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
+        try {
+          await startLlamaServer(modelId);
+        } catch (e) {
+          sendSSEChunk(res, `❌ Failed to start llama-server: ${e.message}\n`);
+          res.write('data: [DONE]\n\n');
+          res.end();
+          return;
+        }
+        pipeToLlamaStream(req, res, body, signalRunning);
+      } else {
+        signalLoading();
+        try {
+          await startLlamaServer(modelId);
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: `Failed to load model: ${e.message}` } }));
+          return;
+        }
+        forwardToLlama(req, res, body, signalRunning);
       }
     } else {
-      // Non-streaming — block until downloaded, then forward
-      try {
-        await ensureDownloaded(modelId);
+      // Model already in RAM
+      if (isStream) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type':      'text/event-stream',
+            'Cache-Control':     'no-cache',
+            'X-Accel-Buffering': 'no',
+          });
+        }
         signalLoading();
-        forwardToOllama(req, res, body, signalRunning);
-      } catch (e) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: `Download failed: ${e.message}` } }));
+        pipeToLlamaStream(req, res, body, signalRunning);
+      } else {
+        signalLoading();
+        forwardToLlama(req, res, body, signalRunning);
       }
     }
     return;
   }
 
-  // Everything else (embeddings, tags, etc.) — forward verbatim
+  // Everything else — forward to llama-server if it's up, else 503
   const body = await readBody(req);
-  forwardToOllama(req, res, body);
+  if (llamaReady) {
+    forwardToLlama(req, res, body);
+  } else {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'No model loaded yet' } }));
+  }
 });
 
 proxyServer.listen(PROXY_PORT, '127.0.0.1', () =>
-  console.log(`[ollama-proxy] listening on 127.0.0.1:${PROXY_PORT}`)
+  console.log(`[llama-proxy] listening on 127.0.0.1:${PROXY_PORT}`)
 );
 
 // ── Status UI (port 4000) ─────────────────────────────────────────────────────
-// Polls ollama state every 5 s and broadcasts changes so the UI stays current.
 let lastSnapshot = { downloaded: [], running: [] };
 setInterval(async () => {
   const [downloaded, running] = await Promise.all([downloadedModels(), runningModels()]);
@@ -400,7 +515,6 @@ setInterval(async () => {
 }, 5000);
 
 function buildStatusSVG(cachedRunning) {
-  // Collect active models: downloading > loading > running (show at most one running)
   const rows = [];
   for (const [model, dl] of downloads) {
     if (dl.status === 'downloading') rows.push({ model, phase: 'downloading', pct: dl.pct, line: dl.line });
@@ -426,24 +540,21 @@ function buildStatusSVG(cachedRunning) {
   function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
   const svgRows = rows.map((r, i) => {
-    const y = PAD + i * ROW;
+    const y    = PAD + i * ROW;
     const barY = y + 40;
     const BAR_W = W - PAD * 2;
 
-    // Badge colours
-    const badgeColor  = COLORS[r.phase] || COLORS.sub;
-    const badgeText   = r.phase === 'downloading' ? `\u2b07 ${r.pct}%`
-                      : r.phase === 'loading'     ? 'loading\u2026'
-                      : r.phase === 'running'     ? 'running'
-                      :                             'idle';
+    const badgeColor = COLORS[r.phase] || COLORS.sub;
+    const badgeText  = r.phase === 'downloading' ? `\u2b07 ${r.pct}%`
+                     : r.phase === 'loading'     ? 'loading\u2026'
+                     : r.phase === 'running'     ? 'running'
+                     :                             'idle';
 
-    // Progress bar fill / indeterminate
     let barContent;
     if (r.phase === 'downloading') {
       const fillW = Math.round(BAR_W * r.pct / 100);
       barContent = `<rect x="${PAD}" y="${barY}" width="${fillW}" height="8" rx="4" fill="${COLORS.bar_dl}"/>`;
     } else if (r.phase === 'loading') {
-      // Animated shimmer via SMIL
       const shimW = Math.round(BAR_W * 0.3);
       barContent = `
         <defs>
@@ -479,7 +590,7 @@ function buildStatusSVG(cachedRunning) {
 }
 
 function buildStatusHTML(total, avail, downloaded, running) {
-  const fitting    = MODELS.filter(m => m.ramGB <= total * 0.85);
+  const fitting = MODELS.filter(m => m.ramGB <= total * 0.85);
 
   const rows = fitting.map(m => {
     const isRunning     = running.includes(m.id);
@@ -489,11 +600,11 @@ function buildStatusHTML(total, avail, downloaded, running) {
     const isLoading     = loadingModels.has(m.id);
 
     let statusBadge;
-    if (isDownloading)    statusBadge = `<span class="badge dl" id="badge-${m.id}">⬇ ${dl.pct}%</span>`;
-    else if (isLoading)   statusBadge = `<span class="badge loading" id="badge-${m.id}">loading…</span>`;
-    else if (isRunning)   statusBadge = `<span class="badge running">running</span>`;
+    if (isDownloading)     statusBadge = `<span class="badge dl" id="badge-${m.id}">⬇ ${dl.pct}%</span>`;
+    else if (isLoading)    statusBadge = `<span class="badge loading" id="badge-${m.id}">loading…</span>`;
+    else if (isRunning)    statusBadge = `<span class="badge running">running</span>`;
     else if (isDownloaded) statusBadge = `<span class="badge downloaded">downloaded</span>`;
-    else                  statusBadge = `<span class="badge none">—</span>`;
+    else                   statusBadge = `<span class="badge none">—</span>`;
 
     let progressRow = '';
     if (isDownloading) {
@@ -591,7 +702,7 @@ function buildStatusHTML(total, avail, downloaded, running) {
 
 <script>
 const es = new EventSource('events');
-const localLoading = new Set(); // models we know are loading, to guard snapshot
+const localLoading = new Set();
 
 function setStatus(model, html) {
   const el = document.getElementById('status-' + model);
@@ -612,7 +723,7 @@ function removeProgressRow(model) {
 function insertProgressRow(model, indeterminate) {
   const row = document.querySelector('[data-model="' + model + '"]');
   if (!row) return;
-  removeProgressRow(model); // replace if already present
+  removeProgressRow(model);
   const pr = document.createElement('tr');
   pr.id = 'progress-row-' + model;
   if (indeterminate) {
@@ -655,11 +766,10 @@ es.onmessage = function(e) {
     removeProgressRow(ev.model);
     setStatus(ev.model, '<span class="badge none" title="' + (ev.error||'') + '">error</span>');
   } else if (ev.type === 'snapshot') {
-    // Full refresh of downloaded/running badges — skip models with live state
     document.querySelectorAll('[data-model]').forEach(row => {
       const id = row.getAttribute('data-model');
       if (localLoading.has(id)) return;
-      if (document.getElementById('progress-row-' + id)) return; // downloading
+      if (document.getElementById('progress-row-' + id)) return;
       const isRunning    = ev.running.includes(id);
       const isDownloaded = ev.downloaded.includes(id);
       if (isRunning)         setStatus(id, '<span class="badge running">running</span>');
@@ -701,14 +811,12 @@ const uiServer = http.createServer((req, res) => {
     });
     res.write(': connected\n\n');
 
-    // Replay in-progress downloads on reconnect
     for (const [model, dl] of downloads) {
       if (dl.status === 'downloading') {
         res.write(`data: ${JSON.stringify({ type: 'start', model })}\n\n`);
         res.write(`data: ${JSON.stringify({ type: 'progress', model, pct: dl.pct, line: dl.line })}\n\n`);
       }
     }
-    // Replay in-progress loads on reconnect
     for (const model of loadingModels) {
       res.write(`data: ${JSON.stringify({ type: 'loading', model })}\n\n`);
     }
