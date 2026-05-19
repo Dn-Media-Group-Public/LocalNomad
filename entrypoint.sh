@@ -3,6 +3,8 @@ set -e
 
 # All config lives under /workspace as hidden dirs — no separate mounts needed.
 export HOME=/workspace
+export OLLAMA_MODELS=/workspace/.ollama/models
+mkdir -p /workspace/.ollama/models
 
 # ── 1. Start Ollama ──────────────────────────────────────────────────────────
 ollama serve &
