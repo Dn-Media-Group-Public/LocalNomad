@@ -1,6 +1,8 @@
 # ── Stage 1: build llama-server with native ARM flags (dotprod, bf16, etc.) ──
 FROM ubuntu:24.04 AS llama-builder
 
+RUN echo Version 1
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \

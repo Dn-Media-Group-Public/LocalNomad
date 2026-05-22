@@ -15,19 +15,25 @@ const LLAMA_PORT      = 11436;   // llama-server — used for inference
 
 // ── Model catalogue ───────────────────────────────────────────────────────────
 const MODELS = [
-  { id: 'qwen2.5-coder:1.5b',    name: 'Qwen2.5-Coder 1.5B',     ramGB:  2, desc: 'Tiny & fast' },
+  // Models must support tool calls (--jinja required, enabled below in startLlamaServer)
+  // Commented-out models have no tool call support and cannot be fixed:
+  //   codellama:7b   — no tool call training
+  //   codellama:13b  — no tool call training
+  //   mistral:7b     — v0.1/v0.2, no tool calls (v0.3 adds them but Ollama tag is ambiguous)
+
+  { id: 'llama3.2:1b',           name: 'Llama 3.2 1B',            ramGB:  2, desc: 'Tiny & fast, tool calls' },
+  { id: 'qwen2.5-coder:1.5b',    name: 'Qwen2.5-Coder 1.5B',      ramGB:  2, desc: 'Tiny coder, tool calls' },
   { id: 'qwen2.5-coder:3b',      name: 'Qwen2.5-Coder 3B',        ramGB:  3, desc: 'Good for simple tasks' },
   { id: 'llama3.2:3b',           name: 'Llama 3.2 3B',            ramGB:  3, desc: 'Small general-purpose' },
-  { id: 'codellama:7b',          name: 'CodeLlama 7B',            ramGB:  6, desc: 'Meta code model' },
-  { id: 'mistral:7b',            name: 'Mistral 7B',              ramGB:  6, desc: 'General purpose' },
   { id: 'qwen2.5-coder:7b',      name: 'Qwen2.5-Coder 7B',        ramGB:  6, desc: 'Recommended starting point' },
   { id: 'llama3.1:8b',           name: 'Llama 3.1 8B',            ramGB:  7, desc: 'Strong general model' },
-  { id: 'codellama:13b',         name: 'CodeLlama 13B',           ramGB: 10, desc: 'Larger code model' },
+  { id: 'gemma2:9b',             name: 'Gemma 2 9B',              ramGB:  8, desc: 'Google, strong reasoning' },
+  { id: 'mistral-nemo:12b',      name: 'Mistral Nemo 12B',        ramGB: 10, desc: 'Mistral, tool calls, strong' },
   { id: 'qwen2.5-coder:14b',     name: 'Qwen2.5-Coder 14B',       ramGB: 11, desc: 'Very capable coder' },
   { id: 'phi4:14b',              name: 'Phi-4 14B',               ramGB: 11, desc: 'Strong reasoning' },
   { id: 'deepseek-coder-v2:16b', name: 'DeepSeek-Coder V2 16B',   ramGB: 13, desc: 'Excellent at code' },
   { id: 'qwen2.5-coder:32b',     name: 'Qwen2.5-Coder 32B',       ramGB: 22, desc: 'Best local coder' },
-  { id: 'llama3.1:70b',          name: 'Llama 3.1 70B',           ramGB: 48, desc: 'Needs ≥64 GB' },
+  { id: 'llama3.3:70b',          name: 'Llama 3.3 70B',           ramGB: 48, desc: 'Needs ≥64 GB' },
 ];
 
 // ── Server-side state ─────────────────────────────────────────────────────────
@@ -119,6 +125,11 @@ function startLlamaServer(modelId) {
     return Promise.reject(new Error(`Cannot find GGUF for ${modelId}: ${e.message}`));
   }
 
+  const logFile = `/tmp/llama-server-${modelId.replace(/[^a-z0-9]/gi, '_')}.log`;
+  const logFd   = fs.openSync(logFile, 'a');
+  fs.writeSync(logFd, `\n\n=== llama-server start: ${new Date().toISOString()} model=${modelId} ===\n`);
+  console.log(`[llama-server] logging to ${logFile}`);
+
   const threads = os.cpus().length;
   llamaProc = spawn('llama-server', [
     '--model',       modelPath,
@@ -126,19 +137,24 @@ function startLlamaServer(modelId) {
     '--host',        LLAMA_HOST,
     '--threads',     String(threads),
     '--ctx-size',    '4096',
-    '--flash-attn',  'on',
+    '--flash-attn',                   // boolean flag — no argument
     '--cache-type-k', 'q8_0',
     '--cache-type-v', 'q8_0',
-  ], { stdio: 'inherit' });
+    '--jinja',                        // use model's built-in chat template (required for tool calls)
+  ], { stdio: ['ignore', logFd, logFd] });
 
   llamaModel = modelId;
 
-  llamaProc.on('exit', () => {
+  llamaProc.on('exit', (code, signal) => {
     if (llamaModel === modelId) {
+      try { fs.writeSync(logFd, `[llama-server] exited code=${code} signal=${signal} at ${new Date().toISOString()}\n`); } catch (_) {}
+      try { fs.closeSync(logFd); } catch (_) {}
+      console.error(`[llama-server] crashed (code=${code} signal=${signal}) — tail ${logFile} for details`);
       llamaProc         = null;
       llamaModel        = null;
       llamaReady        = false;
       llamaStartPromise = null;
+      broadcast({ type: 'unloaded', model: modelId });
     }
   });
 
